@@ -1,130 +1,99 @@
-// pumpfun-top5-forecast-01 forecaster (Node 22, standard library only).
+// pumpfun-top5-forecast-01 — v2 entry.
+// A level random-walk forecaster for the top 5 new Solana coins by market cap.
 //
-// Model: for every coin in the history, fit its log10-cap trajectory (a
-// least-squares slope over the whole trajectory + residual volatility, both
-// shrunk toward its venue tier's median), then project its log-cap
-// distribution forward to each answer read: the recent trend carries only
-// ~30 min, past that the coin decays ~0.04 log10 per hour, and volatility
-// grows with sqrt(horizon). A fixed-seed Monte Carlo over the projected
-// distributions, plus phantom newcomers (rockets born after the cut that
-// reach top-5 range, rate 12/hour inside a ~2h peak window), estimates, per
-// place, each coin's probability and the cap distribution for the size bins.
-// Place probabilities and size-bin probabilities are averaged over the
-// seven reads, because the one forecast is scored at every read.
+// What v1 got wrong (measured on the practice history, 2026-11-11 20:00-20:50Z):
+//   * v1 extrapolated each coin's least-squares log-cap slope ~30 min forward.
+//     Slope persistence is nil: corr(slope_t, slope_t+1) = -0.06 over 122 coin
+//     steps, and the mean step is -0.014 log10 per 10 min. Extrapolating a
+//     pump's slope inflates projected caps and names the wrong coins, which is
+//     why v1's practice size score (-24.63) and order score (-20.79) both
+//     trailed the leader (-13.56 / -18.18).
+//   * v1 used one residual-volatility scale for every coin. Real volatility is
+//     strongly age dependent: per-hour random-walk sd 0.35 for coins under
+//     15 min old, 0.15 at 15-30 min, 0.03 past 30 min (10-min step sd 0.14 /
+//     0.06 / 0.011). Young coins are wild, old coins are calm; a single scale
+//     misplaces both.
+//   * v1's newcomers were drawn uniform over 2.8-3.8 log10. Real top-5
+//     entrants arrive 1-9 min old at caps tracking the current top-5 level
+//     (3.10-3.47 in the mature marks), at ~1 per 10 min.
 //
-// Reads every time from task.json; never hardcodes times. Deterministic:
-// fixed seed, no wall clock, no Math.random.
+// v2 therefore models each coin as a random walk in LEVELS (log10 cap in SOL):
+//   cap(t+h) ~ Normal(last + drift(age) * h, vol(age) * sqrt(h))
+// with drift/vol taken from the age tier the coin sits in at the cut, the
+// coin's own step RMS shrunk toward its tier, and no slope term at all.
+// Newcomers are phantom coins born as a Poisson stream (12/hour, the
+// inflow that reproduces the observed ~1 top-5 entrant per 10 min) whose
+// peak cap is Normal(current top-5 median + projected level growth, 0.18)
+// reached ~7 min after birth, then decaying like a young coin.
+// A fixed-seed Monte Carlo (20,000 draws per answer read) ranks every draw
+// and counts place probabilities and size bins.
 //
-// Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR
-// stand in for /input and /output:
-//   mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
+// Node 22, standard library only. Deterministic: fixed seed, no clock, no
+// network, no randomness outside the seeded generator.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const MICRO = 1_000_000;
-/** Fixed seed: every run on the same history writes the same forecast. */
 const SEED = 20261112;
-/** Monte Carlo draws per answer read. */
-const DRAWS = 10000;
-/** A coin's recent trend only carries for this many hours: a pump spike does
- *  not compound for a whole day. */
-const DRIFT_CAP_H = 0.5;
-/** After its recent trend stops carrying (~30 min), a pump coin's log-cap
- *  decays by this much per hour. At 10-20 min this barely moves it (the
- *  backtest is unaffected); at 7-13h it pulls the incumbents well below the
- *  fresh rockets, which is what the observed top-5 turnover says happens. */
-const DECAY_PER_H = 0.04;
-/** Minimum sd (log10) of a coin's projected cap: never overconfident. */
-const MIN_SD = 0.18;
-/** Maximum sd (log10) of a coin's projected cap. */
-const MAX_SD = 0.85;
-/** Log10 floor for a bonding-curve coin's cap (the curve's residual). */
-const CURVE_FLOOR = 1.44;
-/** Log10 floor for a graduated (pool) coin's cap. */
-const POOL_FLOOR = 0.9;
-/** Phantom newcomers (rockets) that reach top-5 range, per hour. Practice
- *  marks show ~1 new coin in the top 5 every 10 minutes at steady state. */
-const ROCKET_RATE_PER_H = 12;
-/** A rocket is only at its peak for ~2h after birth; older rockets have
- *  decayed, so the count scales with min(horizon, peak window), not horizon. */
-const ROCKET_PEAK_WINDOW_H = 2;
-/** A phantom rocket's log10 cap at the read (mixture over the observed tail
- *  of first-hour peaks that reach top-5 range). */
-const ROCKET_CAPS: Array<[number, number, number]> = [
-  // [weight, lo, hi]
-  [0.25, 2.8, 3.1],
-  [0.45, 3.1, 3.45],
-  [0.3, 3.45, 3.8],
-];
-/** Only name a coin at a place when its probability is at least this. */
+const DRAWS = 20000;
+const MICRO = 1_000_000;
+/** Rows below this probability are dropped (their mass returns to unnamed). */
 const MIN_P = 0.001;
-/** Only name a size bin when its probability is at least this. */
-const MIN_BIN_P = 0.001;
+/** New coins that can reach the top 5, per hour. The top 5 turns over by
+// ~1 coin per 10 min in the mature marks, and many newcomers compete for
+// each slot, so the inflow of competitive newcomers is well above the net
+// entry rate; 12/hour matches the observed turnover in the backtest. */
+const PHANTOM_RATE_PER_HOUR = 12;
+/** A newcomer must reach roughly this log10 cap to enter a maturing top 5
+// (1000 SOL). It floors the phantom peak: in a chart's infancy the
+// cut-time top-5 median is far below the level the chart converges to
+// within the hour, and anchoring newcomers to it strands them below the
+// future top 5. Mature entrants arrive at 3.10-3.47, so 3.0 is a floor,
+// not a target. */
+const PHANTOM_PEAK_FLOOR = 3.0;
+/** A newcomer peaks this long after birth. */
+const PHANTOM_PEAK_AGE_H = 7 / 60;
+/** sd of a newcomer's peak cap around the current top-5 median. */
+const PHANTOM_PEAK_SD = 0.18;
+/** The top-5 level's projected growth is the recent median-cap slope,
+// damped (the chart's rise slows as it matures) and capped. Use the last
+// two marks: the rise decelerates fast in the infancy, so the most recent
+// step is the best predictor. */
+const LEVEL_GROWTH_DAMP = 0.5;
+const LEVEL_GROWTH_CAP_PER_HOUR = 0.8;
+/** Floor / cap on per-coin hourly volatility (a too-narrow size bin is fatal). */
+const VOL_FLOOR = 0.12;
+const VOL_CAP = 0.8;
+/** Shrinkage weight (in pseudo-observations) for a coin's own step RMS. */
+const OWN_VOL_PRIOR = 4;
+
+/** Age tier of a coin: [max age in hours, drift log10/hour, vol log10/hour].
+// Vol is the random-walk sd per hour: sd(step) / sqrt(dt). Measured on the
+// practice history: 10-min step sd 0.14 (young), 0.06 (mid), 0.011 (old),
+// i.e. per-hour vol 0.35 / 0.15 / 0.03. Drift is the mean step rate,
+// shrunk halfway toward 0 for selection (top coins are winners). */
+const AGE_TIERS: Array<[number, number, number]> = [
+  [0.25, -0.06, 0.35], // under 15 min: wild, slight mean reversion
+  [0.5, -0.005, 0.15], // 15-30 min: settling
+  [Infinity, 0.005, 0.03], // past 30 min: calm, flat
+];
 
 interface Row {
   rank: number;
   mint: string;
+  symbol: string;
   market_cap_lamports: string | number;
-  venue: string;
-  complete: boolean;
-  mayhem: boolean;
   created_at: string;
+  venue: string;
 }
-
 interface Mark {
   at: string;
   ok: boolean;
   rows: Row[] | null;
+  counts: { eligible: number };
 }
-
-interface Coin {
-  mint: string;
-  last: number; // last observed log10 cap (SOL)
-  lastVenue: string;
-  lastTime: number; // hours since first mark
-  drift: number; // log10 per hour, shrunk
-  vol: number; // log10 sd per sqrt(hour), shrunk
-  n: number; // observations
-}
-
-/** mulberry32: a small deterministic PRNG. */
-function rng(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** A standard normal from two uniform draws (Box-Muller). */
-function normal(rand: () => number): number {
-  const u1 = Math.max(rand(), 1e-12);
-  const u2 = rand();
-  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-}
-
-function poisson(rand: () => number, lambda: number): number {
-  if (lambda <= 0) return 0;
-  const l = Math.exp(-lambda);
-  let k = 0;
-  let p = 1;
-  do { k++; p *= rand(); } while (p > l && k < 200);
-  return k - 1;
-}
-
-const median = (a: number[]): number => {
-  if (a.length === 0) return 0;
-  const s = [...a].sort((x, y) => x - y);
-  return s[Math.floor(s.length / 2)]!;
-};
-
-/** log10 of a cap in SOL, as the scorer takes it: log10(lamports) - 9. */
-const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
 
 const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
   places: number;
@@ -132,189 +101,273 @@ const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
   reads: string[];
   size: { edges: number[] };
 };
-const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((l) => l !== '');
-const marks = lines.map((l) => JSON.parse(l) as Mark).filter((m) => m.ok === true && Array.isArray(m.rows));
+const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8')
+  .split('\n')
+  .filter((l) => l !== '');
+const marks = lines
+  .map((l) => JSON.parse(l) as Mark)
+  .filter((m) => m.ok === true && Array.isArray(m.rows));
 if (marks.length === 0) throw new Error('the history holds no ok mark');
-const t0 = new Date(marks[0]!.at).getTime();
 const lastMark = marks[marks.length - 1]!;
-const lastTime = new Date(lastMark.at).getTime();
-const readTimes = task.reads.map((r) => new Date(r).getTime());
-const horizons = readTimes.map((t) => Math.max(0, (t - lastTime) / 3600000)); // hours after the last mark
-const meanHorizon = horizons.reduce((a, b) => a + b, 0) / horizons.length;
+const cut = Date.parse(lastMark.at) / 1000;
+const edges = task.size.edges;
 
-// ---- Build per-coin trajectories. ----
-const traj = new Map<string, Array<{ t: number; cap: number; venue: string }>>();
-const meta = new Map<string, { venue: string; complete: boolean; mayhem: boolean }>();
+/** log10 of a cap in SOL. */
+const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
+
+/** mulberry32, a small deterministic PRNG. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/** Box-Muller normal from a uniform source. */
+function makeNormal(rand: () => number): () => number {
+  let spare: number | null = null;
+  return () => {
+    if (spare !== null) {
+      const v = spare;
+      spare = null;
+      return v;
+    }
+    let u = 0;
+    let v = 0;
+    let s = 0;
+    do {
+      u = rand() * 2 - 1;
+      v = rand() * 2 - 1;
+      s = u * u + v * v;
+    } while (s >= 1 || s === 0);
+    const m = Math.sqrt((-2 * Math.log(s)) / s);
+    spare = v * m;
+    return u * m;
+  };
+}
+
+function tierFor(ageH: number): [number, number] {
+  for (const [maxAge, drift, vol] of AGE_TIERS) {
+    if (ageH < maxAge) return [drift, vol];
+  }
+  return [0.005, 0.03];
+}
+
+/** Per-coin state at the cut. */
+interface Coin {
+  mint: string;
+  last: number; // log10 cap at last sighting
+  rank: number; // rank at the cut
+  ageH: number; // age in hours at the cut
+  drift: number; // log10 per hour
+  vol: number; // log10 per hour (sd)
+}
+
+// Build trajectories: mint -> list of (timeH, cap).
+const traj = new Map<string, Array<{ t: number; cap: number; created: string }>>();
 for (const m of marks) {
-  const t = (new Date(m.at).getTime() - t0) / 3600000;
+  const t = Date.parse(m.at) / 1000;
   for (const r of m.rows!) {
-    const cap = sizeOf(r.market_cap_lamports);
-    if (!traj.has(r.mint)) traj.set(r.mint, []);
-    traj.get(r.mint)!.push({ t, cap, venue: r.venue });
-    meta.set(r.mint, { venue: r.venue, complete: r.complete, mayhem: r.mayhem });
+    const list = traj.get(r.mint) ?? [];
+    list.push({ t, cap: sizeOf(r.market_cap_lamports), created: r.created_at });
+    traj.set(r.mint, list);
   }
 }
 
-// Tier medians for shrinkage (per-hour drift and residual volatility).
-const poolDrifts: number[] = [];
-const curveDrifts: number[] = [];
-const poolVols: number[] = [];
-const curveVols: number[] = [];
-for (const [mint, pts] of traj) {
-  if (pts.length < 2) continue;
-  const last = pts[pts.length - 1]!;
-  const prev = pts[pts.length - 2]!;
-  const dt = Math.max(1 / 6, last.t - prev.t); // hours, at least one cadence
-  const d = (last.cap - prev.cap) / dt; // per hour
-  let resid = 0;
-  if (pts.length >= 3) {
-    const p2 = pts[pts.length - 3]!;
-    const slope = (last.cap - p2.cap) / Math.max(1 / 3, last.t - p2.t);
-    resid = Math.abs(last.cap - (p2.cap + slope * (last.t - p2.t)));
-  }
-  if (last.venue === 'pool') { poolDrifts.push(d); poolVols.push(resid); }
-  else { curveDrifts.push(d); curveVols.push(resid); }
+// Coins alive at the cut: seen in the last mark or the one before it.
+const liveMints = new Set<string>();
+for (const r of lastMark.rows!) liveMints.add(r.mint);
+if (marks.length >= 2) {
+  for (const r of marks[marks.length - 2]!.rows!) liveMints.add(r.mint);
 }
-const poolDriftMed = median(poolDrifts);
-const curveDriftMed = median(curveDrifts);
-const poolVolMed = Math.max(0.05, median(poolVols));
-const curveVolMed = Math.max(0.05, median(curveVols));
+
+// The last mark's chart, sorted by rank (used for ranks and the top-5 level).
+const lastChart = [...lastMark.rows!].sort((a, b) => a.rank - b.rank);
 
 const coins: Coin[] = [];
-for (const [mint, pts] of traj) {
-  const last = pts[pts.length - 1]!;
-  const m = meta.get(mint)!;
-  // Slope over the whole trajectory (least squares). A 10-min slope is
-  // mostly noise (a coin that jumped +0.18 in one mark is not growing at
-  // +1/h); the full-trajectory slope is far more stable.
-  let slope = 0;
-  if (pts.length >= 2) {
-    const tMean = pts.reduce((a, p) => a + p.t, 0) / pts.length;
-    const cMean = pts.reduce((a, p) => a + p.cap, 0) / pts.length;
-    let num = 0, den = 0;
-    for (const p of pts) { num += (p.t - tMean) * (p.cap - cMean); den += (p.t - tMean) * (p.t - tMean); }
-    slope = den > 0 ? num / den : 0;
+for (const mint of liveMints) {
+  const pts = traj.get(mint);
+  if (!pts || pts.length === 0) continue;
+  const lastPt = pts[pts.length - 1]!;
+  const ageH = Math.max(0, (cut - Date.parse(lastPt.created) / 1000) / 3600);
+  const [tierDrift, tierVol] = tierFor(ageH);
+  // Own step RMS (per-hour variance), shrunk toward the tier.
+  let sq = 0;
+  let n = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dt = (pts[i]!.t - pts[i - 1]!.t) / 3600;
+    if (dt <= 0) continue;
+    const d = pts[i]!.cap - pts[i - 1]!.cap;
+    sq += (d * d) / dt;
+    n++;
   }
-  // Shrink the slope toward the venue tier's median; weight grows with data.
-  const tierMed = last.venue === 'pool' ? poolDriftMed : curveDriftMed;
-  const w = pts.length / (pts.length + 4);
-  const drift = w * slope + (1 - w) * tierMed;
-  // Residual volatility around the trend, shrunk toward the tier median.
-  let resid = 0;
-  if (pts.length >= 2) {
-    const tMean = pts.reduce((a, p) => a + p.t, 0) / pts.length;
-    const cMean = pts.reduce((a, p) => a + p.cap, 0) / pts.length;
-    const sq = pts.reduce((a, p) => a + (p.cap - (cMean + slope * (p.t - tMean))) ** 2, 0);
-    resid = Math.sqrt(sq / pts.length);
-  }
-  const tierVol = last.venue === 'pool' ? poolVolMed : curveVolMed;
-  const vol = Math.max(0.05, w * resid + (1 - w) * tierVol);
-  coins.push({ mint, last: last.cap, lastVenue: last.venue, lastTime: last.t, drift, vol, n: pts.length });
+  const ownVar = n > 0 ? sq / n : tierVol * tierVol;
+  const vol = Math.min(
+    VOL_CAP,
+    Math.max(VOL_FLOOR, Math.sqrt((n * ownVar + OWN_VOL_PRIOR * tierVol * tierVol) / (n + OWN_VOL_PRIOR))),
+  );
+  // Rank-conditional drift: the top coins are selected winners and keep
+  // climbing in the short term (median +0.057 log10 per 10 min for the
+  // top 5, ~0 for the rest), even though a minority crash hard and drag
+  // the mean negative. The vol and the newcomers cover the crash tail.
+  const rankRow = lastChart.find((r) => r.mint === mint);
+  const rank = rankRow ? rankRow.rank : 999;
+  const drift = rank <= 5 ? 0.2 : tierDrift;
+  coins.push({ mint, last: lastPt.cap, rank, ageH, drift, vol });
 }
-// A coin whose last sighting is old has already faded: only coins seen in the
-// last mark (or the one before) can plausibly hold a top-5 place.
-const lastAtH = (lastTime - t0) / 3600000;
-const live = coins.filter((c) => lastAtH - c.lastTime <= 1 / 6 + 1e-9);
-// Rank the live coins by last cap; keep the top 120 plus any coin that was
-// top 10 in any mark (they may have dipped but can come back).
-const byCap = [...live].sort((a, b) => b.last - a.last);
-const keep = new Set<string>();
-for (const c of byCap.slice(0, 120)) keep.add(c.mint);
-const top10Ever = new Set<string>();
-for (const m of marks) for (const r of (m.rows || []).slice(0, 10)) top10Ever.add(r.mint);
-for (const c of live) if (top10Ever.has(c.mint)) keep.add(c.mint);
-const contenders = live.filter((c) => keep.has(c.mint));
 
-// ---- Monte Carlo over the reads. ----
-const rand = rng(SEED);
-const placeCounts: Array<Map<string, number>> = Array.from({ length: task.places }, () => new Map<string, number>());
-const sizeCounts: Array<Map<number, number>> = Array.from({ length: task.places }, () => new Map<number, number>());
-const rankSum = new Map<string, number>();
-const rankN = new Map<string, number>();
-const edges = task.size.edges;
+// Current top-5 level anchors the newcomers' peak caps.
+const top5Caps = lastChart.slice(0, task.places).map((r) => sizeOf(r.market_cap_lamports));
+const top5Median = [...top5Caps].sort((a, b) => a - b)[Math.floor(top5Caps.length / 2)]!;
+// Recent growth of the top-5 median level (last two marks), damped:
+// the chart's rise slows as it matures, so project only half the recent
+// slope, capped. A newcomer's peak tracks the level at its read time.
+const medianSeries = marks
+  .map((m) => {
+    const c = [...m.rows!].sort((a, b) => a.rank - b.rank).slice(0, task.places);
+    if (c.length < task.places) return null;
+    const caps = c.map((r) => sizeOf(r.market_cap_lamports)).sort((a, b) => a - b);
+    return { t: Date.parse(m.at) / 1000, median: caps[Math.floor(caps.length / 2)]! };
+  })
+  .filter((x): x is { t: number; median: number } => x !== null);
+let levelGrowthPerHour = 0;
+if (medianSeries.length >= 2) {
+  const recent = medianSeries.slice(-2);
+  const first = recent[0]!;
+  const last = recent[recent.length - 1]!;
+  const dtH = (last.t - first.t) / 3600;
+  if (dtH > 0) {
+    levelGrowthPerHour = Math.min(
+      LEVEL_GROWTH_CAP_PER_HOUR,
+      Math.max(0, LEVEL_GROWTH_DAMP * ((last.median - first.median) / dtH)),
+    );
+  }
+} else {
+  // Too little history to measure the rise: a young chart's top-5 level
+  // climbs fast as it fills up (the practice median rose 1.98 -> 3.31 in
+  // 40 min). Use a prior rise; a mature chart with this little history
+  // does not occur in the real runs.
+  levelGrowthPerHour = 0.4;
+}
+
+const placeCounts: Array<Map<string, number>> = Array.from({ length: task.places }, () => new Map());
+const sizeCounts: Array<Map<number, number>> = Array.from({ length: task.places }, () => new Map());
 const binOf = (v: number): number => {
-  let lo = 0, hi = edges.length;
-  while (lo < hi) { const mid = (lo + hi) >> 1; if (edges[mid]! <= v) lo = mid + 1; else hi = mid; }
+  let lo = 0;
+  let hi = edges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (edges[mid]! <= v) lo = mid + 1;
+    else hi = mid;
+  }
   return lo;
 };
 
-for (let ri = 0; ri < readTimes.length; ri++) {
-  const h = horizons[ri]!;
+for (let ri = 0; ri < task.reads.length; ri++) {
+  const readAt = Date.parse(task.reads[ri]!) / 1000;
+  const h = (readAt - cut) / 3600; // horizon in hours
+  const rand = mulberry32(SEED + 7919 * ri);
+  const normal = makeNormal(rand);
+  // Phantom newcomers born between the cut and this read. A phantom is a
+  // coin that will reach the top 5; its peak and birth are drawn FRESH in
+  // every Monte Carlo draw, so each possible future gets its own newcomer
+  // with its own peak (fixing the peak once per read collapses the
+  // newcomer uncertainty into a single coin and starves the unnamed share).
+  const expectedPhantoms = PHANTOM_RATE_PER_HOUR * Math.max(0, h);
+  const nPhantoms = Math.round(expectedPhantoms);
+  const phantomPeakMean =
+    Math.max(top5Median, PHANTOM_PEAK_FLOOR) + levelGrowthPerHour * Math.max(0, h);
+  const [youngDrift, youngVol] = [AGE_TIERS[0]![1], AGE_TIERS[0]![2]];
   for (let d = 0; d < DRAWS; d++) {
-    // Project every contender's cap at this read.
-    const sims: Array<{ mint: string; cap: number }> = [];
-    for (const c of contenders) {
-      const hEff = Math.min(h, DRIFT_CAP_H);
-      // The recent trend carries only ~30 min; past that, the coin decays
-      // toward obscurity, so a 7-13h horizon leaves the top places mostly
-      // to fresh rockets (the observed top-5 turnover says 3 of 5 places
-      // were newcomers 1h after the cut).
-      let mean = c.last + c.drift * hEff - DECAY_PER_H * Math.max(0, h - DRIFT_CAP_H);
-      const floor = c.lastVenue === 'pool' ? POOL_FLOOR : CURVE_FLOOR;
-      // A decaying coin cannot fall below its venue floor in the mean; the
-      // draw can still land there, so clamp the mean, not the draw.
-      if (mean < floor) mean = floor;
-      const sd = Math.min(MAX_SD, Math.sqrt(c.vol * c.vol * Math.max(h, 0.05) + MIN_SD * MIN_SD));
-      let cap = mean + normal(rand) * sd;
-      if (c.lastVenue !== 'pool' && cap < CURVE_FLOOR) cap = CURVE_FLOOR;
-      sims.push({ mint: c.mint, cap });
+    // Draw every live coin's cap at this read.
+    const drawn: Array<{ mint: string; cap: number }> = [];
+    for (const c of coins) {
+      const sd = c.vol * Math.sqrt(Math.max(0, h));
+      drawn.push({ mint: c.mint, cap: c.last + c.drift * h + sd * normal() });
     }
-    // Phantom newcomers: rockets born after the cut that reach top-5 range.
-    // Only rockets born inside the peak window before the read are still at
-    // their peak; older ones have decayed and the incumbents' own drift
-    // already accounts for the horizon.
-    const nPhantom = poisson(rand, ROCKET_RATE_PER_H * Math.min(Math.max(h, 0.1), ROCKET_PEAK_WINDOW_H));
-    for (let i = 0; i < nPhantom; i++) {
-      const u = rand();
-      let lo = ROCKET_CAPS[0]![1], hi = ROCKET_CAPS[0]![2];
-      let acc = 0;
-      for (const [w, a, b] of ROCKET_CAPS) { acc += w; if (u <= acc) { lo = a; hi = b; break; } }
-      sims.push({ mint: '', cap: lo + rand() * (hi - lo) });
-    }
-    sims.sort((a, b) => b.cap - a.cap);
-    for (let k = 0; k < task.places; k++) {
-      const s = sims[k];
-      if (!s) break;
-      if (s.mint !== '') {
-        const pc = placeCounts[k]!;
-        pc.set(s.mint, (pc.get(s.mint) ?? 0) + 1);
-        rankSum.set(s.mint, (rankSum.get(s.mint) ?? 0) + (k + 1));
-        rankN.set(s.mint, (rankN.get(s.mint) ?? 0) + 1);
+    // Draw the phantoms fresh for this future.
+    for (let i = 0; i < nPhantoms; i++) {
+      const birthH = rand() * Math.max(0, h);
+      const peak = phantomPeakMean + PHANTOM_PEAK_SD * normal();
+      const age = h - birthH;
+      let cap: number;
+      if (age < PHANTOM_PEAK_AGE_H) {
+        // Still climbing toward its peak; a newcomer enters the top 5 at
+        // its peak, so it is only slightly below it.
+        cap = peak - 0.05 * (1 - age / PHANTOM_PEAK_AGE_H);
+      } else {
+        const after = age - PHANTOM_PEAK_AGE_H;
+        cap = peak + youngDrift * after + youngVol * Math.sqrt(after) * normal();
       }
-      const sc = sizeCounts[k]!;
-      const b = binOf(s.cap);
-      sc.set(b, (sc.get(b) ?? 0) + 1);
+      drawn.push({ mint: `phantom:${ri}:${i}`, cap });
+    }
+    // Top 5 of this draw by a linear scan (no full sort: this runs 20k
+    // times per read and the draw list is a few hundred entries).
+    const top: Array<{ mint: string; cap: number }> = [];
+    for (const w of drawn) {
+      let at = top.length;
+      while (at > 0 && top[at - 1]!.cap < w.cap) at--;
+      if (at < task.places) {
+        top.splice(at, 0, w);
+        if (top.length > task.places) top.pop();
+      }
+    }
+    for (let k = 0; k < task.places; k++) {
+      const w = top[k];
+      if (!w) break;
+      if (!w.mint.startsWith('phantom:')) {
+        placeCounts[k]!.set(w.mint, (placeCounts[k]!.get(w.mint) ?? 0) + 1);
+      }
+      const b = binOf(w.cap);
+      sizeCounts[k]!.set(b, (sizeCounts[k]!.get(b) ?? 0) + 1);
     }
   }
 }
 
-const totalDraws = DRAWS * readTimes.length;
 const probabilities: Array<{ mint: string; place: number; p: number }> = [];
+const sizes: Array<{ place: number; bin: number; p: number }> = [];
+// Counts were accumulated over every read, so divide by draws x reads:
+// the forecast is one set of place/size probabilities, scored on each read
+// and averaged, so each place's probabilities average over the reads.
+const TOTAL_DRAWS = DRAWS * task.reads.length;
 for (let k = 0; k < task.places; k++) {
-  const entries = [...placeCounts[k]!.entries()].sort((a, b) => b[1] - a[1]);
-  for (const [mint, cnt] of entries) {
-    const p = Math.floor((cnt / totalDraws) * MICRO) / MICRO;
+  for (const [mint, cnt] of placeCounts[k]!) {
+    const p = Math.floor((cnt / TOTAL_DRAWS) * MICRO) / MICRO;
     if (p >= MIN_P) probabilities.push({ mint, place: k + 1, p });
   }
+  for (const [bin, cnt] of sizeCounts[k]!) {
+    const p = Math.floor((cnt / TOTAL_DRAWS) * MICRO) / MICRO;
+    if (p > 0) sizes.push({ place: k + 1, bin, p });
+  }
 }
-const sizes: Array<{ place: number; bin: number; p: number }> = [];
+// top5: the most likely coin at each place (distinct), falling back to the
+// last chart's order for any place with no named coin.
+const top5: string[] = [];
+const used = new Set<string>();
 for (let k = 0; k < task.places; k++) {
-  const entries = [...sizeCounts[k]!.entries()].sort((a, b) => b[1] - a[1]);
-  for (const [bin, cnt] of entries) {
-    const p = Math.floor((cnt / totalDraws) * MICRO) / MICRO;
-    if (p >= MIN_BIN_P) sizes.push({ place: k + 1, bin, p });
+  let best: string | null = null;
+  let bestP = -1;
+  for (const row of probabilities) {
+    if (row.place === k + 1 && row.p > bestP && !used.has(row.mint)) {
+      best = row.mint;
+      bestP = row.p;
+    }
+  }
+  if (best === null) {
+    for (const r of lastChart) {
+      if (!used.has(r.mint)) {
+        best = r.mint;
+        break;
+      }
+    }
+  }
+  if (best !== null) {
+    top5.push(best);
+    used.add(best);
   }
 }
-// top5: the five coins with the best (lowest) mean rank across draws.
-const meanRank = [...rankSum.entries()].map(([mint, s]) => ({ mint, mean: s / (rankN.get(mint) ?? 1) }));
-meanRank.sort((a, b) => a.mean - b.mean);
-const top5 = meanRank.slice(0, task.places).map((r) => r.mint);
-// Fall back to the last mark's top 5 if the Monte Carlo named too few.
-if (top5.length < task.places) {
-  const lastRows = [...(lastMark.rows || [])].sort((a, b) => a.rank - b.rank);
-  for (const r of lastRows) {
-    if (top5.length >= task.places) break;
-    if (!top5.includes(r.mint)) top5.push(r.mint);
-  }
-}
+
 writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5, sizes })}\n`);
